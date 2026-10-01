@@ -841,6 +841,8 @@ def _attach_fake_datasets_api(
     data_items: list[SimpleNamespace],
     delete_error: Exception | None = None,
     fail_once_on: str | None = None,
+    phantom_deletes: dict[str, int] | None = None,
+    list_errors: dict[int, Exception] | None = None,
 ) -> SimpleNamespace:
     """Attach a fake ``cognee.datasets`` namespace; returns a call recorder.
 
@@ -850,10 +852,18 @@ def _attach_fake_datasets_api(
     ``calls.live_items`` so tests can simulate items (re)appearing.
     ``fail_once_on`` makes ``delete_data`` raise exactly once for that
     data_id, then succeed — an interrupted deletion.
+    ``phantom_deletes`` maps a data_id to how many times ``delete_data``
+    should RETURN SUCCESS while leaving the item in place — a deletion the
+    store accepted but did not carry out. ``list_errors`` maps a 1-based
+    ``list_data`` call number to an exception raised by that call — a
+    transient listing failure during discovery or verification. Every
+    ``list_data`` call is counted in ``calls.list_calls``.
     """
-    calls = SimpleNamespace(deleted=[], live_items=list(data_items))
+    calls = SimpleNamespace(deleted=[], live_items=list(data_items), list_calls=0)
     dataset = SimpleNamespace(name=dataset_name, id="dataset-uuid")
     pending_one_shot: set[str] = {fail_once_on} if fail_once_on else set()
+    phantom_budget: dict[str, int] = dict(phantom_deletes or {})
+    scheduled_list_errors: dict[int, Exception] = dict(list_errors or {})
 
     class _Datasets:
         @staticmethod
@@ -863,6 +873,10 @@ def _attach_fake_datasets_api(
         @staticmethod
         async def list_data(dataset_id):
             assert dataset_id == "dataset-uuid"
+            calls.list_calls += 1
+            error = scheduled_list_errors.pop(calls.list_calls, None)
+            if error is not None:
+                raise error
             return list(calls.live_items)
 
         @staticmethod
@@ -873,6 +887,9 @@ def _attach_fake_datasets_api(
                 pending_one_shot.discard(data_id)
                 raise RuntimeError(f"transient delete failure for {data_id}")
             calls.deleted.append({"dataset_id": dataset_id, "data_id": data_id})
+            if phantom_budget.get(data_id, 0) > 0:
+                phantom_budget[data_id] -= 1
+                return  # reported success, item left in place
             calls.live_items[:] = [item for item in calls.live_items if item.id != data_id]
 
     module.datasets = _Datasets
@@ -1122,14 +1139,167 @@ class TestSynthesizedModeDeletionContract:
         # Retry: data-1's hash is proven via the ledger (it no longer has an
         # item to match), data-2 is deleted now — full proof, delete succeeds.
         assert await backend.delete_memory(memory.id) is True
+        assert [d["data_id"] for d in calls.deleted] == ["data-1", "data-2"]
         assert await backend.get_memory(memory.id) is None
+
+    async def test_verification_failure_then_retry_cannot_succeed_while_item_remains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Public-API regression: a hash deleted-but-unverified must never be
+        taken as proof on retry.
+
+        Attempt 1: ``delete_data`` reports success but leaves the item in
+        place, then the verification re-list raises. The ledger entry written
+        after deletion is only PENDING, so the retry must resume at
+        verification (re-listing) instead of short-circuiting to success —
+        and while the item is still present it must keep failing closed.
+        """
+        original = "Vasilije prefers uv over poetry for Python projects"
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(
+            module,
+            "ds",
+            [SimpleNamespace(id="data-1", content_hash=_md5(original), raw_content_hash=None)],
+            phantom_deletes={"data-1": 2},  # attempts 1 and 2 "succeed" without removing
+            list_errors={2: RuntimeError("transient listing failure")},  # attempt 1's verify
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(content=original, user_id="alice", importance=0.5)
+
+        # Attempt 1: discovery (list #1) finds the item, delete is a phantom,
+        # verification (list #2) raises → fail closed.
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert calls.list_calls == 2
+        assert len(calls.live_items) == 1  # the item is still there
+        assert await backend.get_memory(memory.id) is not None
+
+        # Attempt 2: the pending ledger entry is NOT proof. The retry must
+        # re-list, find the item, delete again (phantom again) and, with the
+        # item still present after verification, fail closed again.
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert calls.list_calls == 4  # discovery + verification really ran
+        assert len(calls.live_items) == 1
+        assert await backend.get_memory(memory.id) is not None
+
+        # Attempt 3: the delete finally takes effect; verification proves it.
+        assert await backend.delete_memory(memory.id) is True
+        assert calls.live_items == []
+        assert await backend.get_memory(memory.id) is None
+
+    async def test_verification_failure_after_real_removal_resumes_verification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Progress is preserved: items genuinely removed before the
+        verification re-list failed are NOT re-deleted on retry — the retry
+        re-verifies them (re-lists, finds them gone) and only then succeeds."""
+        content = "the main content"
+        fact = "an extracted fact"
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(
+            module,
+            "ds",
+            [
+                SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None),
+                SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None),
+            ],
+            list_errors={2: RuntimeError("transient listing failure")},  # attempt 1's verify
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert {d["data_id"] for d in calls.deleted} == {"data-1", "data-2"}
+        assert calls.live_items == []
+        assert await backend.get_memory(memory.id) is not None
+
+        # Retry: both hashes are pending; the re-list finds no items, which
+        # completes their verification. Nothing is deleted a second time, and
+        # the verification listing really happened.
+        list_calls_before = calls.list_calls
+        assert await backend.delete_memory(memory.id) is True
+        assert calls.list_calls == list_calls_before + 1
+        assert len(calls.deleted) == 2
+        assert await backend.get_memory(memory.id) is None
+
+    async def test_verification_keeps_progress_for_removed_items_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When verification finds SOME items still present, only those hashes
+        lose their ledger entries; genuinely removed hashes stay proven, so the
+        retry deletes just the leftovers and never re-deletes the rest."""
+        content = "the main content"
+        fact = "an extracted fact"
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(
+            module,
+            "ds",
+            [
+                SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None),
+                SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None),
+            ],
+            phantom_deletes={"data-2": 1},  # data-1 really goes; data-2 stays once
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert [item.id for item in calls.live_items] == ["data-2"]
+        assert await backend.get_memory(memory.id) is not None
+
+        # Retry: data-1 is already verified gone (never has to match an item
+        # again), data-2 is rediscovered and deleted for real.
+        assert await backend.delete_memory(memory.id) is True
+        assert [d["data_id"] for d in calls.deleted] == ["data-1", "data-2", "data-2"]
+        assert calls.live_items == []
+        assert await backend.get_memory(memory.id) is None
+
+    def test_pre_split_ledger_rows_migrate_to_pending(self, tmp_path) -> None:
+        """A ledger written before the pending/verified split (no ``verified``
+        column) is migrated in place, and its rows come back as PENDING — so
+        a retry re-verifies them instead of trusting a record that may have
+        been written before verification ever ran."""
+        db_path = tmp_path / "meta.db"
+        content_hash = _md5("doomed")
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE hard_deleted (dataset TEXT NOT NULL, content_hash TEXT NOT NULL, "
+                "created_at TEXT, PRIMARY KEY (dataset, content_hash))"
+            )
+            conn.execute(
+                "INSERT INTO hard_deleted (dataset, content_hash, created_at) VALUES (?, ?, ?)",
+                ("ds", content_hash, "2026-01-01T00:00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = cognee_backend_module._CogneeMetadataStore(db_path)
+        assert store.get_hard_delete_ledger("ds", {content_hash}) == {content_hash: False}
+
+        store.mark_hard_delete_verified("ds", {content_hash})
+        assert store.get_hard_delete_ledger("ds", {content_hash}) == {content_hash: True}
 
     async def test_resave_clears_ledger_so_stale_proof_cannot_vouch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Re-saving content invalidates its old 'provably removed' record."""
         module, _ = _make_fake_cognee()
-        calls = _attach_fake_datasets_api(
+        _attach_fake_datasets_api(
             module,
             "ds",
             [SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)],

@@ -64,9 +64,12 @@ Deletion contract (split by search type):
       ``CogneeDeletionUnverifiedError`` — delete tombstones the content and
       keeps the registry row for retry; update refuses before mutating
       anything. Discovery is non-mutating (a partial match deletes nothing)
-      and completed removals are recorded in a durable ``hard_deleted``
-      ledger, so a failed or interrupted attempt is always retryable. This
-      backend never reports a deletion it cannot stand behind.
+      and removals are tracked in a durable ``hard_deleted`` ledger as
+      PENDING (items deleted, not yet verified gone) or VERIFIED (a re-list
+      found none) — only VERIFIED is proof, and a retry resumes the
+      verification of pending hashes rather than trusting them — so a failed
+      or interrupted attempt is always retryable and never passes as
+      success. This backend never reports a deletion it cannot stand behind.
 
 Known limitations (cognee v1.x):
     - cognee has no per-item update API. ``update_memory`` updates the durable
@@ -392,10 +395,23 @@ class _CogneeMetadataStore:
                                 dataset TEXT NOT NULL,
                                 content_hash TEXT NOT NULL,
                                 created_at TEXT,
+                                verified INTEGER NOT NULL DEFAULT 0,
                                 PRIMARY KEY (dataset, content_hash)
                             )
                             """
                         )
+                        # Ledgers written before the pending/verified split
+                        # carry no ``verified`` column; treat every such row
+                        # as pending so a retry re-verifies it rather than
+                        # trusting an unverified record.
+                        columns = {
+                            row[1] for row in conn.execute("PRAGMA table_info(hard_deleted)")
+                        }
+                        if "verified" not in columns:
+                            conn.execute(
+                                "ALTER TABLE hard_deleted "
+                                "ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
+                            )
                         conn.commit()
                     finally:
                         conn.close()
@@ -564,39 +580,71 @@ class _CogneeMetadataStore:
             conn.close()
 
     # -- hard-delete ledger ---------------------------------------------------
-    # Records content hashes this store has PROVABLY hard-deleted from a
-    # cognee dataset. "Absence of a matching data item" is deliberately not
-    # proof of removal (chunk-registered rows hash differently from their
-    # source), so without this ledger a hard delete that got interrupted
-    # after removing some items could never be re-proven on retry — the
-    # already-removed hashes would look identical to never-stored ones.
+    # Records content hashes this store has hard-deleted from a cognee
+    # dataset, in one of two states:
+    #
+    # - PENDING: ``delete_data`` was issued (and returned) for every data
+    #   item known for the hash, but no re-list has yet confirmed the items
+    #   are gone. A pending hash is NOT proof — a retry must re-verify it.
+    # - VERIFIED: a re-list after deletion found no matching item. Only this
+    #   state counts as proof of removal.
+    #
+    # "Absence of a matching data item" is deliberately not proof on its own
+    # (chunk-registered rows hash differently from their source), so without
+    # this ledger a hard delete that got interrupted after removing some
+    # items could never be re-proven on retry — the already-removed hashes
+    # would look identical to never-stored ones. The pending state is what
+    # lets a retry tell "we removed this, verify it" from "never stored".
 
-    def get_hard_deleted(self, dataset: str, content_hashes: set[str]) -> set[str]:
-        """Return the subset of hashes already provably hard-deleted."""
+    def get_hard_delete_ledger(self, dataset: str, content_hashes: set[str]) -> dict[str, bool]:
+        """Return ``{content_hash: verified}`` for the hashes in the ledger.
+
+        Hashes with no ledger row are absent from the result.
+        """
         if not content_hashes:
-            return set()
+            return {}
         conn = self._connect()
         try:
             placeholders = ",".join("?" for _ in content_hashes)
             rows = conn.execute(
-                f"SELECT content_hash FROM hard_deleted "
+                f"SELECT content_hash, verified FROM hard_deleted "
                 f"WHERE dataset = ? AND content_hash IN ({placeholders})",
                 (dataset, *content_hashes),
             ).fetchall()
         finally:
             conn.close()
-        return {row[0] for row in rows}
+        return {row[0]: bool(row[1]) for row in rows}
 
-    def record_hard_deleted(self, dataset: str, content_hashes: set[str]) -> None:
-        """Durably record hashes whose data items were deleted from cognee."""
+    def record_hard_delete_pending(self, dataset: str, content_hashes: set[str]) -> None:
+        """Durably record hashes whose data items were deleted but not yet verified gone.
+
+        An existing row (pending or verified) is left untouched.
+        """
         if not content_hashes:
             return
         now_iso = _utcnow().isoformat()
         conn = self._connect()
         try:
             conn.executemany(
-                "INSERT OR IGNORE INTO hard_deleted (dataset, content_hash, created_at) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO hard_deleted (dataset, content_hash, created_at, verified) "
+                "VALUES (?, ?, ?, 0)",
+                [(dataset, h, now_iso) for h in content_hashes],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def mark_hard_delete_verified(self, dataset: str, content_hashes: set[str]) -> None:
+        """Promote hashes to VERIFIED: a re-list found no matching data item."""
+        if not content_hashes:
+            return
+        now_iso = _utcnow().isoformat()
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT INTO hard_deleted (dataset, content_hash, created_at, verified) "
+                "VALUES (?, ?, ?, 1) "
+                "ON CONFLICT(dataset, content_hash) DO UPDATE SET verified = 1",
                 [(dataset, h, now_iso) for h in content_hashes],
             )
             conn.commit()
@@ -604,7 +652,11 @@ class _CogneeMetadataStore:
             conn.close()
 
     def clear_hard_deleted(self, dataset: str, content_hashes: set[str]) -> None:
-        """Forget ledger entries for content that was re-added to cognee."""
+        """Forget ledger entries (pending or verified) for the given hashes.
+
+        Used when content is re-added to cognee, and when a verification
+        re-list finds a hash's data items still present.
+        """
         if not content_hashes:
             return
         conn = self._connect()
@@ -1094,22 +1146,33 @@ class CogneeBackend:
         """Hard-delete data items from cognee's stores; report whether proven.
 
         cognee identifies text data items by an MD5 content hash. Removal is
-        PROVEN only when every content's hash is accounted for. Three phases,
-        so a failure at any point leaves the operation retryable:
+        PROVEN only when every content's hash is accounted for. The durable
+        ``hard_deleted`` ledger tracks each hash as PENDING (every known item
+        deleted, not yet verified gone) or VERIFIED (a re-list found none).
+        Only VERIFIED counts as proof. Three phases, so a failure at any
+        point leaves the operation retryable:
 
-        1. Discovery (NON-MUTATING): map every requested hash to its stored
-           data items. Hashes this store already provably deleted (durable
-           ``hard_deleted`` ledger) count as done. If any remaining hash has
-           no matching item, return False WITHOUT deleting anything —
-           "nothing matched" is not proof (a chunk-registered row hashes
-           differently from its source item), and deleting the matched
-           subset first would make the unmatched remainder permanently
-           unprovable on retry.
+        1. Discovery (NON-MUTATING): map every unverified hash to its stored
+           data items. A hash with no ledger row that matches no item makes
+           the whole call return False WITHOUT deleting anything — "nothing
+           matched" is not proof (a chunk-registered row hashes differently
+           from its source item), and deleting the matched subset first would
+           make the unmatched remainder permanently unprovable on retry. A
+           PENDING hash that matches no item is different: this call already
+           deleted its items, so absence completes its verification and the
+           hash is promoted to VERIFIED right away (progress is preserved
+           even if the rest of this call fails). A PENDING hash that still
+           matches items is deleted again.
         2. Deletion: per hash, delete all its items, then durably record the
-           hash in the ledger — so an interruption between items never
-           strands an already-removed hash as unprovable.
-        3. Verification: re-list; no matching item may remain. On failure the
-           just-recorded ledger entries are cleared.
+           hash as PENDING — so an interruption between items never strands
+           an already-removed hash as unprovable, and an interruption after
+           deletion never lets an unverified hash pass as proof.
+        3. Verification: re-list. Hashes with no matching item left are
+           promoted to VERIFIED; hashes whose items remain have their ledger
+           entries cleared (the items are observable, so a retry rediscovers
+           them). If the re-list itself fails, the PENDING entries stay
+           pending, and the next call resumes at verification instead of
+           reporting success.
 
         Failures are logged, never raised; callers decide whether an unproven
         removal is acceptable (``CHUNKS`` tombstone enforcement) or must fail
@@ -1131,10 +1194,12 @@ class CogneeBackend:
         dataset_name = self._config.dataset_name
         try:
             hashes = {self._content_hash(content) for content in contents}
-            already_deleted = await asyncio.to_thread(
-                self._store.get_hard_deleted, dataset_name, hashes
+            ledger = await asyncio.to_thread(
+                self._store.get_hard_delete_ledger, dataset_name, hashes
             )
-            remaining = hashes - already_deleted
+            verified = {h for h, is_verified in ledger.items() if is_verified}
+            pending = {h for h, is_verified in ledger.items() if not is_verified}
+            remaining = hashes - verified
             if not remaining:
                 return True
 
@@ -1143,22 +1208,36 @@ class CogneeBackend:
             matched: set[str] = set()
             for _, _, overlap in found:
                 matched |= overlap
-            if matched != remaining:
+            unknown = remaining - pending  # no ledger row: must match a stored item
+            if not unknown <= matched:
                 logger.info(
                     "Hard delete unproven: %d of %d contents have no matching "
                     "cognee data item; nothing was deleted",
-                    len(remaining - matched),
+                    len(unknown - matched),
                     len(hashes),
                 )
                 return False
 
-            # Phase 2 — delete per hash, recording each completed hash durably.
+            # A pending hash with no item left was deleted by an earlier call
+            # whose verification never completed; this listing completes it.
+            resumed = pending - matched
+            if resumed:
+                await asyncio.to_thread(
+                    self._store.mark_hard_delete_verified, dataset_name, resumed
+                )
+                logger.info(
+                    "Resumed verification for %d previously deleted cognee data item hash(es)",
+                    len(resumed),
+                )
+            if not matched:
+                return True
+
+            # Phase 2 — delete per hash, recording each completed hash as pending.
             items_by_hash: dict[str, list[tuple[Any, Any]]] = {}
             for dataset_id, data_id, overlap in found:
                 for h in overlap:
                     items_by_hash.setdefault(h, []).append((dataset_id, data_id))
             deleted_ids: set[Any] = set()
-            recorded: set[str] = set()
             for h, items in items_by_hash.items():
                 for dataset_id, data_id in items:
                     if data_id in deleted_ids:
@@ -1170,13 +1249,26 @@ class CogneeBackend:
                         data_id,
                         dataset_name,
                     )
-                await asyncio.to_thread(self._store.record_hard_deleted, dataset_name, {h})
-                recorded.add(h)
+                await asyncio.to_thread(self._store.record_hard_delete_pending, dataset_name, {h})
 
-            # Phase 3 — verification: nothing matching may remain.
-            if await self._list_matching_items(datasets_api, remaining):
-                logger.warning("Hard delete unproven: matching data items remain after deletion")
-                await asyncio.to_thread(self._store.clear_hard_deleted, dataset_name, recorded)
+            # Phase 3 — verification: nothing matching may remain. Hashes
+            # verified gone are promoted; hashes still present are cleared
+            # from the ledger (their items are observable, so a retry
+            # rediscovers and deletes them). If this re-list raises, every
+            # hash deleted above stays PENDING and the next call re-verifies.
+            still_present: set[str] = set()
+            for _, _, overlap in await self._list_matching_items(datasets_api, matched):
+                still_present |= overlap
+            gone = matched - still_present
+            if gone:
+                await asyncio.to_thread(self._store.mark_hard_delete_verified, dataset_name, gone)
+            if still_present:
+                logger.warning(
+                    "Hard delete unproven: data items for %d of %d contents remain after deletion",
+                    len(still_present),
+                    len(hashes),
+                )
+                await asyncio.to_thread(self._store.clear_hard_deleted, dataset_name, still_present)
                 return False
             return True
         except Exception:
