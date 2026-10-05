@@ -70,6 +70,17 @@ Deletion contract (split by search type):
       verification of pending hashes rather than trusting them — so a failed
       or interrupted attempt is always retryable and never passes as
       success. This backend never reports a deletion it cannot stand behind.
+    - The hard delete is scoped to the OWNING USER. cognee identifies text by
+      content hash, so two users who stored the same text share a hash; it
+      keeps one data item per node set (the node set is part of its dedup
+      identity), so each user's copy is a separate item tagged ``user:<id>``.
+      Discovery, deletion, verification and the ledger all act only on items
+      carrying the owner's tag: deleting Alice's memory never touches Bob's
+      identical one, and a removal verified for Alice never vouches for Bob.
+      An item whose tags cannot be read is nobody's and is never deleted.
+    - ``update_memory`` with unchanged content is a metadata-only rewrite:
+      nothing is tombstoned, reclaimed or re-added, since the stored item IS
+      the new content. A fact equal to the new content is likewise kept.
 
 Known limitations (cognee v1.x):
     - cognee has no per-item update API. ``update_memory`` updates the durable
@@ -393,25 +404,15 @@ class _CogneeMetadataStore:
                             """
                             CREATE TABLE IF NOT EXISTS hard_deleted (
                                 dataset TEXT NOT NULL,
+                                owner TEXT NOT NULL DEFAULT '',
                                 content_hash TEXT NOT NULL,
                                 created_at TEXT,
                                 verified INTEGER NOT NULL DEFAULT 0,
-                                PRIMARY KEY (dataset, content_hash)
+                                PRIMARY KEY (dataset, owner, content_hash)
                             )
                             """
                         )
-                        # Ledgers written before the pending/verified split
-                        # carry no ``verified`` column; treat every such row
-                        # as pending so a retry re-verifies it rather than
-                        # trusting an unverified record.
-                        columns = {
-                            row[1] for row in conn.execute("PRAGMA table_info(hard_deleted)")
-                        }
-                        if "verified" not in columns:
-                            conn.execute(
-                                "ALTER TABLE hard_deleted "
-                                "ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
-                            )
+                        self._migrate_hard_delete_ledger(conn)
                         conn.commit()
                     finally:
                         conn.close()
@@ -579,9 +580,47 @@ class _CogneeMetadataStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _migrate_hard_delete_ledger(conn: sqlite3.Connection) -> None:
+        """Bring a ledger written by an earlier revision up to the current shape.
+
+        Two earlier shapes exist. Before the pending/verified split the table
+        had no ``verified`` column; before owner scoping it had no ``owner``
+        column and its primary key was ``(dataset, content_hash)``. SQLite
+        cannot change a primary key in place, so an owner-less table is
+        rebuilt: its rows are copied under the legacy owner ``''`` as PENDING
+        (never as proof — an unscoped record cannot vouch for any one owner's
+        data). ``get_hard_delete_ledger`` reads such rows as pending for
+        every owner, so the retry that re-verifies them is still possible
+        rather than the hash being stranded as never-stored.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(hard_deleted)")}
+        if "owner" in columns:
+            return
+        if "verified" not in columns:
+            conn.execute("ALTER TABLE hard_deleted ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE hard_deleted RENAME TO hard_deleted_legacy")
+        conn.execute(
+            """
+            CREATE TABLE hard_deleted (
+                dataset TEXT NOT NULL,
+                owner TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                created_at TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (dataset, owner, content_hash)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO hard_deleted (dataset, owner, content_hash, created_at, verified) "
+            "SELECT dataset, '', content_hash, created_at, 0 FROM hard_deleted_legacy"
+        )
+        conn.execute("DROP TABLE hard_deleted_legacy")
+
     # -- hard-delete ledger ---------------------------------------------------
     # Records content hashes this store has hard-deleted from a cognee
-    # dataset, in one of two states:
+    # dataset FOR ONE OWNER (the memory's user), in one of two states:
     #
     # - PENDING: ``delete_data`` was issued (and returned) for every data
     #   item known for the hash, but no re-list has yet confirmed the items
@@ -596,10 +635,14 @@ class _CogneeMetadataStore:
     # would look identical to never-stored ones. The pending state is what
     # lets a retry tell "we removed this, verify it" from "never stored".
 
-    def get_hard_delete_ledger(self, dataset: str, content_hashes: set[str]) -> dict[str, bool]:
-        """Return ``{content_hash: verified}`` for the hashes in the ledger.
+    def get_hard_delete_ledger(
+        self, dataset: str, owner: str, content_hashes: set[str]
+    ) -> dict[str, bool]:
+        """Return ``{content_hash: verified}`` for the owner's hashes in the ledger.
 
-        Hashes with no ledger row are absent from the result.
+        Hashes with no ledger row are absent from the result. A legacy row
+        recorded before owner scoping (owner ``''``) is reported as PENDING
+        for every owner: it is never proof, but it keeps the hash retryable.
         """
         if not content_hashes:
             return {}
@@ -607,15 +650,23 @@ class _CogneeMetadataStore:
         try:
             placeholders = ",".join("?" for _ in content_hashes)
             rows = conn.execute(
-                f"SELECT content_hash, verified FROM hard_deleted "
-                f"WHERE dataset = ? AND content_hash IN ({placeholders})",
-                (dataset, *content_hashes),
+                f"SELECT content_hash, owner, verified FROM hard_deleted "
+                f"WHERE dataset = ? AND owner IN (?, '') AND content_hash IN ({placeholders})",
+                (dataset, owner, *content_hashes),
             ).fetchall()
         finally:
             conn.close()
-        return {row[0]: bool(row[1]) for row in rows}
+        ledger: dict[str, bool] = {}
+        for content_hash, row_owner, verified in rows:
+            if row_owner == owner:
+                ledger[content_hash] = bool(verified)
+            else:
+                ledger.setdefault(content_hash, False)
+        return ledger
 
-    def record_hard_delete_pending(self, dataset: str, content_hashes: set[str]) -> None:
+    def record_hard_delete_pending(
+        self, dataset: str, owner: str, content_hashes: set[str]
+    ) -> None:
         """Durably record hashes whose data items were deleted but not yet verified gone.
 
         An existing row (pending or verified) is left untouched.
@@ -626,36 +677,47 @@ class _CogneeMetadataStore:
         conn = self._connect()
         try:
             conn.executemany(
-                "INSERT OR IGNORE INTO hard_deleted (dataset, content_hash, created_at, verified) "
-                "VALUES (?, ?, ?, 0)",
-                [(dataset, h, now_iso) for h in content_hashes],
+                "INSERT OR IGNORE INTO hard_deleted "
+                "(dataset, owner, content_hash, created_at, verified) VALUES (?, ?, ?, ?, 0)",
+                [(dataset, owner, h, now_iso) for h in content_hashes],
             )
             conn.commit()
         finally:
             conn.close()
 
-    def mark_hard_delete_verified(self, dataset: str, content_hashes: set[str]) -> None:
-        """Promote hashes to VERIFIED: a re-list found no matching data item."""
+    def mark_hard_delete_verified(self, dataset: str, owner: str, content_hashes: set[str]) -> None:
+        """Promote the owner's hashes to VERIFIED: a re-list found no matching data item.
+
+        A legacy unscoped row for the hash has served its purpose once the
+        owner's verification completes and is dropped.
+        """
         if not content_hashes:
             return
         now_iso = _utcnow().isoformat()
         conn = self._connect()
         try:
             conn.executemany(
-                "INSERT INTO hard_deleted (dataset, content_hash, created_at, verified) "
-                "VALUES (?, ?, ?, 1) "
-                "ON CONFLICT(dataset, content_hash) DO UPDATE SET verified = 1",
-                [(dataset, h, now_iso) for h in content_hashes],
+                "INSERT INTO hard_deleted (dataset, owner, content_hash, created_at, verified) "
+                "VALUES (?, ?, ?, ?, 1) "
+                "ON CONFLICT(dataset, owner, content_hash) DO UPDATE SET verified = 1",
+                [(dataset, owner, h, now_iso) for h in content_hashes],
+            )
+            placeholders = ",".join("?" for _ in content_hashes)
+            conn.execute(
+                f"DELETE FROM hard_deleted WHERE dataset = ? AND owner = '' "
+                f"AND content_hash IN ({placeholders})",
+                (dataset, *content_hashes),
             )
             conn.commit()
         finally:
             conn.close()
 
-    def clear_hard_deleted(self, dataset: str, content_hashes: set[str]) -> None:
-        """Forget ledger entries (pending or verified) for the given hashes.
+    def clear_hard_deleted(self, dataset: str, owner: str, content_hashes: set[str]) -> None:
+        """Forget the owner's ledger entries (pending or verified) for the given hashes.
 
-        Used when content is re-added to cognee, and when a verification
-        re-list finds a hash's data items still present.
+        Used when the owner re-adds content to cognee, and when a verification
+        re-list finds a hash's data items still present. Legacy unscoped rows
+        go too: the owner's own listing just showed the truth for these hashes.
         """
         if not content_hashes:
             return
@@ -663,8 +725,9 @@ class _CogneeMetadataStore:
         try:
             placeholders = ",".join("?" for _ in content_hashes)
             conn.execute(
-                f"DELETE FROM hard_deleted WHERE dataset = ? AND content_hash IN ({placeholders})",
-                (dataset, *content_hashes),
+                f"DELETE FROM hard_deleted WHERE dataset = ? AND owner IN (?, '') "
+                f"AND content_hash IN ({placeholders})",
+                (dataset, owner, *content_hashes),
             )
             conn.commit()
         finally:
@@ -902,6 +965,7 @@ class CogneeBackend:
         await asyncio.to_thread(
             self._store.clear_hard_deleted,
             self._config.dataset_name,
+            user_id or "",
             {
                 self._content_hash(item)
                 for item in [content, *(facts or [])]
@@ -1124,15 +1188,52 @@ class CogneeBackend:
         """cognee's data-item content hash (MD5 of the text)."""
         return hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
 
+    @staticmethod
+    def _item_node_set(data_item: Any) -> set[str] | None:
+        """The node-set tags a cognee data item was stored under, or None if unknown.
+
+        cognee keeps them on ``Data.node_set`` (a JSON-encoded list on ORM
+        rows, a list on API rows since cognee exposes ``nodeSet``) and mirrors
+        them in ``external_metadata["node_set"]``; both spellings are read.
+        """
+        raw = getattr(data_item, "node_set", None)
+        if raw is None:
+            external = getattr(data_item, "external_metadata", None)
+            if isinstance(external, str):
+                try:
+                    external = json.loads(external)
+                except ValueError:
+                    external = None
+            if isinstance(external, dict):
+                raw = external.get("node_set")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        if isinstance(raw, list | tuple | set):
+            return {str(tag) for tag in raw}
+        return None
+
     async def _list_matching_items(
-        self, datasets_api: Any, wanted: set[str]
+        self, datasets_api: Any, wanted: set[str], owner_tag: str
     ) -> list[tuple[Any, Any, set[str]]]:
-        """List (dataset_id, data_id, matching_hashes) without mutating anything."""
+        """List (dataset_id, data_id, matching_hashes) without mutating anything.
+
+        Only data items tagged with ``owner_tag`` (the memory owner's
+        ``node_set`` tag) count. Two users who stored the same text hold the
+        same content hash in one dataset, and cognee keeps one data item per
+        node set — so the tag, not the hash, is the ownership boundary.
+        An item whose tags cannot be read is nobody's and never matched.
+        """
         found: list[tuple[Any, Any, set[str]]] = []
         for dataset in await datasets_api.list_datasets() or []:
             if getattr(dataset, "name", None) != self._config.dataset_name:
                 continue
             for data_item in await datasets_api.list_data(dataset.id) or []:
+                tags = self._item_node_set(data_item)
+                if not tags or owner_tag not in tags:
+                    continue
                 item_hashes = {
                     getattr(data_item, "content_hash", None),
                     getattr(data_item, "raw_content_hash", None),
@@ -1142,15 +1243,19 @@ class CogneeBackend:
                     found.append((dataset.id, data_item.id, overlap))
         return found
 
-    async def _try_hard_delete(self, contents: list[str]) -> bool:
-        """Hard-delete data items from cognee's stores; report whether proven.
+    async def _try_hard_delete(self, contents: list[str], owner_id: str) -> bool:
+        """Hard-delete ONE OWNER's data items from cognee's stores; report whether proven.
 
-        cognee identifies text data items by an MD5 content hash. Removal is
-        PROVEN only when every content's hash is accounted for. The durable
-        ``hard_deleted`` ledger tracks each hash as PENDING (every known item
-        deleted, not yet verified gone) or VERIFIED (a re-list found none).
-        Only VERIFIED counts as proof. Three phases, so a failure at any
-        point leaves the operation retryable:
+        cognee identifies text data items by an MD5 content hash and keeps one
+        item per node set, so discovery, deletion, verification and the ledger
+        are all scoped to the owner's ``user:<id>`` tag: another user's item
+        holding the same text is never listed, never deleted, and never
+        vouched for. Removal is PROVEN only when every content's hash is
+        accounted for within that scope. The durable ``hard_deleted`` ledger
+        tracks each (owner, hash) as PENDING (every known item deleted, not
+        yet verified gone) or VERIFIED (a re-list found none). Only VERIFIED
+        counts as proof. Three phases, so a failure at any point leaves the
+        operation retryable:
 
         1. Discovery (NON-MUTATING): map every unverified hash to its stored
            data items. A hash with no ledger row that matches no item makes
@@ -1192,10 +1297,12 @@ class CogneeBackend:
             return False
 
         dataset_name = self._config.dataset_name
+        owner = owner_id or ""
+        owner_tag = _user_tag(owner_id)
         try:
             hashes = {self._content_hash(content) for content in contents}
             ledger = await asyncio.to_thread(
-                self._store.get_hard_delete_ledger, dataset_name, hashes
+                self._store.get_hard_delete_ledger, dataset_name, owner, hashes
             )
             verified = {h for h, is_verified in ledger.items() if is_verified}
             pending = {h for h, is_verified in ledger.items() if not is_verified}
@@ -1204,7 +1311,7 @@ class CogneeBackend:
                 return True
 
             # Phase 1 — discovery, non-mutating.
-            found = await self._list_matching_items(datasets_api, remaining)
+            found = await self._list_matching_items(datasets_api, remaining, owner_tag)
             matched: set[str] = set()
             for _, _, overlap in found:
                 matched |= overlap
@@ -1223,7 +1330,7 @@ class CogneeBackend:
             resumed = pending - matched
             if resumed:
                 await asyncio.to_thread(
-                    self._store.mark_hard_delete_verified, dataset_name, resumed
+                    self._store.mark_hard_delete_verified, dataset_name, owner, resumed
                 )
                 logger.info(
                     "Resumed verification for %d previously deleted cognee data item hash(es)",
@@ -1249,7 +1356,9 @@ class CogneeBackend:
                         data_id,
                         dataset_name,
                     )
-                await asyncio.to_thread(self._store.record_hard_delete_pending, dataset_name, {h})
+                await asyncio.to_thread(
+                    self._store.record_hard_delete_pending, dataset_name, owner, {h}
+                )
 
             # Phase 3 — verification: nothing matching may remain. Hashes
             # verified gone are promoted; hashes still present are cleared
@@ -1257,18 +1366,22 @@ class CogneeBackend:
             # rediscovers and deletes them). If this re-list raises, every
             # hash deleted above stays PENDING and the next call re-verifies.
             still_present: set[str] = set()
-            for _, _, overlap in await self._list_matching_items(datasets_api, matched):
+            for _, _, overlap in await self._list_matching_items(datasets_api, matched, owner_tag):
                 still_present |= overlap
             gone = matched - still_present
             if gone:
-                await asyncio.to_thread(self._store.mark_hard_delete_verified, dataset_name, gone)
+                await asyncio.to_thread(
+                    self._store.mark_hard_delete_verified, dataset_name, owner, gone
+                )
             if still_present:
                 logger.warning(
                     "Hard delete unproven: data items for %d of %d contents remain after deletion",
                     len(still_present),
                     len(hashes),
                 )
-                await asyncio.to_thread(self._store.clear_hard_deleted, dataset_name, still_present)
+                await asyncio.to_thread(
+                    self._store.clear_hard_deleted, dataset_name, owner, still_present
+                )
                 return False
             return True
         except Exception:
@@ -1330,12 +1443,25 @@ class CogneeBackend:
         if user_id and existing.user_id and existing.user_id != user_id:
             raise ValueError("Cannot update memories belonging to other users")
 
+        if new_content == existing.content:
+            # Nothing to replace: the stored cognee data item IS the new
+            # content, and tombstoning or reclaiming it would hide the
+            # memory from its own user's searches. Record the update on the
+            # row and keep the facts, which still describe this content.
+            return await self._record_same_content_update(existing, reason)
+
         old_contents = [existing.content]
         for fact in existing.metadata.get("_cognee_facts") or []:
             if isinstance(fact, str) and fact:
                 old_contents.append(fact)
+        # A fact that happens to equal the new content stays stored for it
+        # too: never tombstone or reclaim what the update is putting in place.
+        new_hash = self._content_hash(new_content)
+        old_contents = [c for c in old_contents if self._content_hash(c) != new_hash]
 
-        if not self._tombstones_fully_enforce() and not await self._try_hard_delete(old_contents):
+        if not self._tombstones_fully_enforce() and not await self._try_hard_delete(
+            old_contents, existing.user_id
+        ):
             raise CogneeDeletionUnverifiedError(
                 f"Cannot verify cognee removed the old data behind memory "
                 f"{memory_id}; refusing to update under search type "
@@ -1385,13 +1511,42 @@ class CogneeBackend:
         await asyncio.to_thread(
             self._store.clear_hard_deleted,
             self._config.dataset_name,
-            {self._content_hash(new_content)},
+            existing.user_id or "",
+            {new_hash},
         )
         if self._tombstones_fully_enforce():
             # Best-effort reclaim; under non-CHUNKS the old data was already
             # verifiably removed before any mutation.
-            await self._try_hard_delete(old_contents)
+            await self._try_hard_delete(old_contents, existing.user_id)
         logger.info("Updated memory %s in place (old content tombstoned)", memory_id)
+        return updated
+
+    async def _record_same_content_update(self, existing: Memory, reason: str | None) -> Memory:
+        """``update_memory`` with unchanged content: a metadata-only rewrite.
+
+        No cognee mutation (the data item already holds this content), no
+        tombstone (the content is live), no fact drop (they describe it).
+        Re-saving through ``upsert_memory`` also clears any tombstone an
+        earlier delete left for this text, so the memory is searchable again.
+        """
+        now = _utcnow()
+        metadata = dict(existing.metadata)
+        if reason:
+            metadata["update_reason"] = reason
+            metadata["updated_at"] = now.isoformat()
+        updated = Memory(
+            id=existing.id,
+            content=existing.content,
+            user_id=existing.user_id,
+            session_id=existing.session_id,
+            importance=existing.importance,
+            entity_refs=existing.entity_refs,
+            metadata=metadata,
+            created_at=existing.created_at,
+            valid_from=now,
+        )
+        await asyncio.to_thread(self._store.upsert_memory, updated, clear_tombstone=True)
+        logger.info("Updated memory %s in place (content unchanged)", existing.id)
         return updated
 
     async def delete_memory(
@@ -1445,7 +1600,7 @@ class CogneeBackend:
                 contents.append(fact)
 
         if not self._tombstones_fully_enforce():
-            if not await self._try_hard_delete(contents):
+            if not await self._try_hard_delete(contents, existing.user_id):
                 # Defense in depth: suppress text-matched surfacing, keep the
                 # registry row so the caller can retry, and refuse to report
                 # a deletion that synthesized results could contradict.
@@ -1471,7 +1626,7 @@ class CogneeBackend:
         await asyncio.to_thread(
             self._store.delete_and_tombstone, memory_id, existing.user_id, contents
         )
-        await self._try_hard_delete(contents)
+        await self._try_hard_delete(contents, existing.user_id)
         logger.info(
             "Deleted memory %s (reason: %s); durable tombstone recorded",
             memory_id,

@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import types
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -266,15 +267,15 @@ class TestMetadataDbPathResolution:
         cfg = CogneeConfig(
             metadata_db_path="/explicit/meta.db", data_root="/data", system_root="/sys"
         )
-        assert str(_resolve_metadata_db_path(cfg)) == "/explicit/meta.db"
+        assert _resolve_metadata_db_path(cfg) == Path("/explicit/meta.db")
 
     def test_defaults_under_data_root(self) -> None:
         cfg = CogneeConfig(metadata_db_path=None, data_root="/data", system_root="/sys")
-        assert str(_resolve_metadata_db_path(cfg)) == "/data/headroom_cognee_meta.db"
+        assert _resolve_metadata_db_path(cfg) == Path("/data") / "headroom_cognee_meta.db"
 
     def test_falls_back_to_system_root(self) -> None:
         cfg = CogneeConfig(metadata_db_path=None, data_root=None, system_root="/sys")
-        assert str(_resolve_metadata_db_path(cfg)) == "/sys/headroom_cognee_meta.db"
+        assert _resolve_metadata_db_path(cfg) == Path("/sys") / "headroom_cognee_meta.db"
 
     def test_falls_back_to_workspace_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
@@ -902,14 +903,31 @@ def _md5(content: str) -> str:
     return hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
+def _item(data_id: str, content: str, owner: str = "alice", **extra: Any) -> SimpleNamespace:
+    """A fake cognee data item for ``content`` stored under ``owner``'s node set.
+
+    Mirrors what cognee's datasets API lists: the content hash plus the
+    ``node_set`` tags the item was added with (``user:<id>`` is the
+    ownership boundary the backend's hard delete is scoped to).
+    """
+    fields: dict[str, Any] = {
+        "id": data_id,
+        "content_hash": _md5(content),
+        "raw_content_hash": None,
+        "node_set": [f"user:{owner}"],
+    }
+    fields.update(extra)
+    return SimpleNamespace(**fields)
+
+
 class TestBestEffortHardDelete:
     async def test_delete_hard_deletes_matching_data_by_content_hash(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         module, _ = _make_fake_cognee()
         data_items = [
-            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
-            SimpleNamespace(id="data-2", content_hash=_md5("other fact"), raw_content_hash=None),
+            _item("data-1", "doomed fact"),
+            _item("data-2", "other fact"),
         ]
         calls = _attach_fake_datasets_api(module, "ds", data_items)
         monkeypatch.setitem(sys.modules, "cognee", module)
@@ -926,7 +944,7 @@ class TestBestEffortHardDelete:
         """The durable tombstone wins even when cognee's delete API fails."""
         module, _ = _make_fake_cognee(search_results=[_fake_hit(["doomed fact"])])
         data_items = [
-            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
+            _item("data-1", "doomed fact"),
         ]
         _attach_fake_datasets_api(module, "ds", data_items, delete_error=RuntimeError("boom"))
         monkeypatch.setitem(sys.modules, "cognee", module)
@@ -940,7 +958,7 @@ class TestBestEffortHardDelete:
         """Data items in unrelated datasets are never touched."""
         module, _ = _make_fake_cognee()
         data_items = [
-            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
+            _item("data-1", "doomed fact"),
         ]
         calls = _attach_fake_datasets_api(module, "someone_elses_dataset", data_items)
         monkeypatch.setitem(sys.modules, "cognee", module)
@@ -963,7 +981,7 @@ class TestBestEffortHardDelete:
             raise RuntimeError("cognee is down")
 
         monkeypatch.setattr(backend, "_ensure_initialized", broken_init)
-        assert await backend._try_hard_delete(["doomed fact"]) is False
+        assert await backend._try_hard_delete(["doomed fact"], "alice") is False
         # Under CHUNKS the tombstone is authoritative, so the public delete
         # still succeeds — and its results filter provably excludes the text.
         assert await backend.delete_memory(memory.id) is True
@@ -975,18 +993,217 @@ class TestBestEffortHardDelete:
         monkeypatch.setitem(sys.modules, "cognee", module)
 
         backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
-        assert await backend._try_hard_delete(["never stored verbatim"]) is False
+        assert await backend._try_hard_delete(["never stored verbatim"], "alice") is False
 
     async def test_matched_and_verified_is_proven(self, monkeypatch: pytest.MonkeyPatch) -> None:
         module, _ = _make_fake_cognee()
         data_items = [
-            SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None),
+            _item("data-1", "doomed"),
         ]
         _attach_fake_datasets_api(module, "ds", data_items)
         monkeypatch.setitem(sys.modules, "cognee", module)
 
         backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
-        assert await backend._try_hard_delete(["doomed"]) is True
+        assert await backend._try_hard_delete(["doomed"], "alice") is True
+
+
+# =============================================================================
+# Hard delete is scoped to the owning user (user:<id> node-set tag)
+# =============================================================================
+
+
+class TestUserScopedHardDelete:
+    """Two users who store the same text hold the same content hash. cognee
+    keeps one data item per node set (dedup identity includes ``node_set``),
+    so the backend must only ever discover, delete, verify and ledger the
+    OWNER's item — never the other user's."""
+
+    @pytest.mark.parametrize("search_type", ["CHUNKS", "GRAPH_COMPLETION"])
+    async def test_alices_delete_leaves_bobs_identical_memory(
+        self, monkeypatch: pytest.MonkeyPatch, search_type: str
+    ) -> None:
+        shared = "the deploy runs on Fridays"
+        module, _ = _make_fake_cognee(search_results=[_fake_hit([shared])])
+        calls = _attach_fake_datasets_api(
+            module,
+            "ds",
+            [_item("data-alice", shared, owner="alice"), _item("data-bob", shared, owner="bob")],
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type=search_type))
+        alice = await backend.save_memory(content=shared, user_id="alice", importance=0.5)
+        bob = await backend.save_memory(content=shared, user_id="bob", importance=0.5)
+
+        assert await backend.delete_memory(alice.id) is True
+
+        # Only Alice's cognee item went; Bob's is untouched and still listed.
+        assert [d["data_id"] for d in calls.deleted] == ["data-alice"]
+        assert [item.id for item in calls.live_items] == ["data-bob"]
+        # Bob's memory is intact and still surfaces in his searches; Alice's
+        # tombstone is hers alone.
+        assert await backend.get_memory(bob.id) is not None
+        bob_results = await backend.search_memories(query="deploy", user_id="bob")
+        assert [r.memory.content for r in bob_results] == [shared]
+        assert await backend.search_memories(query="deploy", user_id="alice") == []
+
+    async def test_other_users_item_is_not_proof_of_removal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under a synthesized search type, the only item holding Alice's
+        text belongs to Bob: deleting it would be data loss and proves
+        nothing about Alice's data, so the delete fails closed."""
+        shared = "the deploy runs on Fridays"
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(module, "ds", [_item("data-bob", shared, owner="bob")])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        alice = await backend.save_memory(content=shared, user_id="alice", importance=0.5)
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(alice.id)
+        assert calls.deleted == []
+        assert [item.id for item in calls.live_items] == ["data-bob"]
+
+    async def test_items_without_node_set_are_nobodys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An item whose owner cannot be read is never deleted on a hash match."""
+        module, _ = _make_fake_cognee()
+        untagged = SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)
+        calls = _attach_fake_datasets_api(module, "ds", [untagged])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        assert await backend._try_hard_delete(["doomed"], "alice") is False
+        assert calls.deleted == []
+
+    async def test_node_set_read_from_json_string_and_external_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cognee spells the tags as a JSON string on ORM rows and mirrors
+        them into ``external_metadata``; both resolve to the owner."""
+        module, _ = _make_fake_cognee()
+        items = [
+            _item("json-row", "one", node_set='["user:alice", "session:s1"]'),
+            _item(
+                "external-row",
+                "two",
+                node_set=None,
+                external_metadata={"node_set": ["user:alice"]},
+            ),
+        ]
+        calls = _attach_fake_datasets_api(module, "ds", items)
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        assert await backend._try_hard_delete(["one", "two"], "alice") is True
+        assert sorted(d["data_id"] for d in calls.deleted) == ["external-row", "json-row"]
+
+    async def test_ledger_proof_is_per_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Alice's verified removal must not vouch for Bob's identical text."""
+        shared = "the deploy runs on Fridays"
+        module, _ = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", [_item("data-alice", shared, owner="alice")])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        alice = await backend.save_memory(content=shared, user_id="alice", importance=0.5)
+        bob = await backend.save_memory(content=shared, user_id="bob", importance=0.5)
+        assert await backend.delete_memory(alice.id) is True  # proven for Alice
+
+        # Bob's item was never in the fake store, so his removal is unproven
+        # even though the same hash was just verified gone for Alice.
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(bob.id)
+
+
+class TestIdenticalContentUpdate:
+    """``update_memory`` with the content unchanged must not tombstone or
+    reclaim the very data item the memory lives in."""
+
+    @pytest.mark.parametrize("search_type", ["CHUNKS", "GRAPH_COMPLETION"])
+    async def test_save_update_identical_search_round_trip(
+        self, monkeypatch: pytest.MonkeyPatch, search_type: str
+    ) -> None:
+        content = "Vasilije prefers uv over poetry"
+        module, cognee_calls = _make_fake_cognee(search_results=[_fake_hit([content])])
+        calls = _attach_fake_datasets_api(module, "ds", [_item("data-1", content)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type=search_type))
+        memory = await backend.save_memory(content=content, user_id="alice", importance=0.5)
+        adds_before = len(cognee_calls.add)
+
+        updated = await backend.update_memory(memory.id, content, reason="touch")
+
+        assert updated.id == memory.id
+        assert updated.content == content
+        assert updated.metadata["update_reason"] == "touch"
+        # No cognee mutation at all: nothing re-added, nothing deleted.
+        assert len(cognee_calls.add) == adds_before
+        assert calls.deleted == []
+        assert [item.id for item in calls.live_items] == ["data-1"]
+        # Still the user's own, still searchable, not tombstoned.
+        results = await backend.search_memories(query="uv", user_id="alice")
+        assert [r.memory.id for r in results] == [memory.id]
+        assert await asyncio.to_thread(backend._store.get_tombstones, "alice") == set()
+
+    async def test_identical_update_keeps_facts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Facts still describe unchanged content; they must survive."""
+        content = "Vasilije prefers uv over poetry"
+        fact = "prefers uv"
+        module, _ = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", [_item("data-1", content), _item("data-2", fact)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+        updated = await backend.update_memory(memory.id, content)
+        assert updated.metadata.get("_cognee_facts") == [fact]
+
+    async def test_identical_update_revives_deleted_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tombstone left by an earlier delete of the same text is cleared:
+        the update is an explicit request to make this content live."""
+        content = "Vasilije prefers uv over poetry"
+        module, _ = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", [_item("data-1", content)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content=content, user_id="alice", importance=0.5)
+        await asyncio.to_thread(backend._store.add_tombstones, "alice", [content])
+
+        await backend.update_memory(memory.id, content)
+        assert await asyncio.to_thread(backend._store.get_tombstones, "alice") == set()
+
+    async def test_update_never_reclaims_a_fact_equal_to_new_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Promoting a fact to be the memory's content must not tombstone or
+        hard-delete that fact's text — it is the content now."""
+        content = "Vasilije prefers uv over poetry"
+        fact = "prefers uv"
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(
+            module, "ds", [_item("data-1", content), _item("data-2", fact)]
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+        updated = await backend.update_memory(memory.id, fact)
+
+        assert updated.content == fact
+        assert [d["data_id"] for d in calls.deleted] == ["data-1"]
+        assert await asyncio.to_thread(backend._store.get_tombstones, "alice") == {content}
 
 
 # =============================================================================
@@ -1015,7 +1232,7 @@ class TestSynthesizedModeDeletionContract:
         _attach_fake_datasets_api(
             module,
             "ds",
-            [SimpleNamespace(id="data-1", content_hash=_md5(original), raw_content_hash=None)],
+            [_item("data-1", original)],
             delete_error=RuntimeError("delete_data is down"),
         )
         monkeypatch.setitem(sys.modules, "cognee", module)
@@ -1040,7 +1257,7 @@ class TestSynthesizedModeDeletionContract:
         _attach_fake_datasets_api(
             module,
             "ds",
-            [SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)],
+            [_item("data-1", "doomed")],
         )
         monkeypatch.setitem(sys.modules, "cognee", module)
 
@@ -1083,7 +1300,7 @@ class TestSynthesizedModeDeletionContract:
         calls = _attach_fake_datasets_api(
             module,
             "ds",
-            [SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None)],
+            [_item("data-1", content)],
         )
         monkeypatch.setitem(sys.modules, "cognee", module)
 
@@ -1099,9 +1316,7 @@ class TestSynthesizedModeDeletionContract:
 
         # Once the fact's data item exists too, the SAME delete succeeds:
         # the earlier failure left the state fully retryable.
-        calls.live_items.append(
-            SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None)
-        )
+        calls.live_items.append(_item("data-2", fact))
         assert await backend.delete_memory(memory.id) is True
         assert {d["data_id"] for d in calls.deleted} == {"data-1", "data-2"}
         assert await backend.get_memory(memory.id) is None
@@ -1119,8 +1334,8 @@ class TestSynthesizedModeDeletionContract:
             module,
             "ds",
             [
-                SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None),
-                SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None),
+                _item("data-1", content),
+                _item("data-2", fact),
             ],
             fail_once_on="data-2",
         )
@@ -1159,7 +1374,7 @@ class TestSynthesizedModeDeletionContract:
         calls = _attach_fake_datasets_api(
             module,
             "ds",
-            [SimpleNamespace(id="data-1", content_hash=_md5(original), raw_content_hash=None)],
+            [_item("data-1", original)],
             phantom_deletes={"data-1": 2},  # attempts 1 and 2 "succeed" without removing
             list_errors={2: RuntimeError("transient listing failure")},  # attempt 1's verify
         )
@@ -1203,8 +1418,8 @@ class TestSynthesizedModeDeletionContract:
             module,
             "ds",
             [
-                SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None),
-                SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None),
+                _item("data-1", content),
+                _item("data-2", fact),
             ],
             list_errors={2: RuntimeError("transient listing failure")},  # attempt 1's verify
         )
@@ -1243,8 +1458,8 @@ class TestSynthesizedModeDeletionContract:
             module,
             "ds",
             [
-                SimpleNamespace(id="data-1", content_hash=_md5(content), raw_content_hash=None),
-                SimpleNamespace(id="data-2", content_hash=_md5(fact), raw_content_hash=None),
+                _item("data-1", content),
+                _item("data-2", fact),
             ],
             phantom_deletes={"data-2": 1},  # data-1 really goes; data-2 stays once
         )
@@ -1289,10 +1504,49 @@ class TestSynthesizedModeDeletionContract:
             conn.close()
 
         store = cognee_backend_module._CogneeMetadataStore(db_path)
-        assert store.get_hard_delete_ledger("ds", {content_hash}) == {content_hash: False}
+        # Legacy rows carry no owner; they are reported to every owner as
+        # PENDING until that owner's own verification replaces them.
+        assert store.get_hard_delete_ledger("ds", "alice", {content_hash}) == {content_hash: False}
+        assert store.get_hard_delete_ledger("ds", "bob", {content_hash}) == {content_hash: False}
 
-        store.mark_hard_delete_verified("ds", {content_hash})
-        assert store.get_hard_delete_ledger("ds", {content_hash}) == {content_hash: True}
+        store.mark_hard_delete_verified("ds", "alice", {content_hash})
+        assert store.get_hard_delete_ledger("ds", "alice", {content_hash}) == {content_hash: True}
+        # Alice's verification is hers alone: Bob's identical content is not
+        # vouched for, and the legacy row it replaced is gone.
+        assert store.get_hard_delete_ledger("ds", "bob", {content_hash}) == {}
+
+    def test_owner_keyed_ledger_migrates_from_dataset_keyed(self, tmp_path) -> None:
+        """A ledger from the pending/verified era but before owner scoping
+        (no ``owner`` column) is migrated in place; its rows keep their
+        hashes but lose their proof — PENDING, since the verification that
+        wrote them did not check whose item was removed."""
+        db_path = tmp_path / "meta.db"
+        content_hash = _md5("doomed")
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE hard_deleted (dataset TEXT NOT NULL, content_hash TEXT NOT NULL, "
+                "created_at TEXT, verified INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (dataset, content_hash))"
+            )
+            conn.execute(
+                "INSERT INTO hard_deleted (dataset, content_hash, created_at, verified) "
+                "VALUES (?, ?, ?, 1)",
+                ("ds", content_hash, "2026-01-01T00:00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = cognee_backend_module._CogneeMetadataStore(db_path)
+        assert store.get_hard_delete_ledger("ds", "alice", {content_hash}) == {content_hash: False}
+        conn = sqlite3.connect(str(db_path))
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(hard_deleted)")}
+            assert {"dataset", "owner", "content_hash", "verified"} <= columns
+            assert conn.execute("SELECT COUNT(*) FROM hard_deleted").fetchone()[0] == 1
+        finally:
+            conn.close()
 
     async def test_resave_clears_ledger_so_stale_proof_cannot_vouch(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1302,7 +1556,7 @@ class TestSynthesizedModeDeletionContract:
         _attach_fake_datasets_api(
             module,
             "ds",
-            [SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)],
+            [_item("data-1", "doomed")],
         )
         monkeypatch.setitem(sys.modules, "cognee", module)
 
