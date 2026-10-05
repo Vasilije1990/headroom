@@ -65,7 +65,7 @@ Deletion contract (split by search type):
       keeps the registry row for retry; update refuses before mutating
       anything. Discovery is non-mutating (a partial match deletes nothing)
       and removals are tracked in a durable ``hard_deleted`` ledger as
-      PENDING (items deleted, not yet verified gone) or VERIFIED (a re-list
+      PENDING (deletion begun, not yet verified gone) or VERIFIED (a re-list
       found none) — only VERIFIED is proof, and a retry resumes the
       verification of pending hashes rather than trusting them — so a failed
       or interrupted attempt is always retryable and never passes as
@@ -147,6 +147,14 @@ class CogneeDeletionUnverifiedError(RuntimeError):
 # system_root, or the headroom workspace dir, in that order).
 _METADATA_DB_FILENAME = "headroom_cognee_meta.db"
 
+# Search over-fetch bounds. Tombstoned hits are filtered after cognee ranked
+# them, so a request for ``top_k`` is widened by the number of tombstones the
+# partition carries (capped), and re-issued with a doubled limit while a full
+# page of hits still yields fewer than ``top_k`` visible ones.
+_SEARCH_OVERFETCH_CAP = 200
+_SEARCH_FETCH_ROUNDS = 3
+_SEARCH_FETCH_HARD_CAP = 1000
+
 
 def _utcnow() -> datetime:
     """Return current UTC time as timezone-aware datetime."""
@@ -172,6 +180,23 @@ def _stable_memory_id(user_id: str, content: str) -> str:
 def _user_tag(user_id: str) -> str:
     """Build the node_set tag for a user."""
     return f"user:{user_id}"
+
+
+def _is_tombstoned(text: str, tombstones: set[str]) -> bool:
+    """Whether a search-result chunk matches a tombstoned content.
+
+    Matches by exact equality or when the chunk is a fragment of a tombstoned
+    content (cognee chunks long documents, so a chunk of a deleted memory is a
+    substring of the tombstoned original). The other direction — a chunk that
+    *contains* a tombstoned text plus more — is a different, live memory whose
+    own text happens to include it, and is kept. Best-effort: text that cognee
+    transformed during cognify may not match.
+    """
+    if not tombstones:
+        return False
+    if text in tombstones:
+        return True
+    return any(text in tombstoned for tombstoned in tombstones)
 
 
 def _session_tag(session_id: str) -> str:
@@ -627,9 +652,10 @@ class _CogneeMetadataStore:
     # Records content hashes this store has hard-deleted from a cognee
     # dataset FOR ONE OWNER (the memory's tenant partition id), in one of two states:
     #
-    # - PENDING: ``delete_data`` was issued (and returned) for every data
-    #   item known for the hash, but no re-list has yet confirmed the items
-    #   are gone. A pending hash is NOT proof — a retry must re-verify it.
+    # - PENDING: the hash's data items were observed and their deletion
+    #   begun (the row is written before the first ``delete_data``), but no
+    #   re-list has yet confirmed the items are gone. A pending hash is NOT
+    #   proof — a retry must re-verify it (re-deleting anything still there).
     # - VERIFIED: a re-list after deletion found no matching item. Only this
     #   state counts as proof of removal.
     #
@@ -672,9 +698,11 @@ class _CogneeMetadataStore:
     def record_hard_delete_pending(
         self, dataset: str, owner: str, content_hashes: set[str]
     ) -> None:
-        """Durably record hashes whose data items were deleted but not yet verified gone.
+        """Durably record hashes whose observed data items are being deleted (not yet verified gone).
 
-        An existing row (pending or verified) is left untouched.
+        Written before the first delete so no interruption can strand a
+        removed hash without a row. An existing row (pending or verified) is
+        left untouched.
         """
         if not content_hashes:
             return
@@ -768,6 +796,89 @@ class _CogneeMetadataStore:
         finally:
             conn.close()
         return {row[0] for row in rows}
+
+    def resolve_search_results(
+        self,
+        user_id: str,
+        session_id: str | None,
+        items: list[tuple[str, dict[str, Any]]],
+        top_k: int,
+        now: datetime,
+    ) -> tuple[list[Memory], int]:
+        """Filter search hits against tombstones and resolve them to registry rows — atomically.
+
+        Returns ``(memories, visible_count)``: the first ``top_k`` visible hits
+        resolved to canonical ``Memory`` rows, and how many hits survived the
+        tombstone filter in total (for rank-based scoring).
+
+        The tombstone read, the row lookup and the insert of unmatched hits
+        happen in ONE write transaction (``BEGIN IMMEDIATE``), so a concurrent
+        ``delete_memory`` / ``update_memory`` — which tombstones in its own
+        transaction — either commits before this one starts (its tombstone is
+        seen and the hit dropped) or after it ends (the hit was legitimately
+        live when this search ran). A delete can never slip between the filter
+        and the insert and have the search re-create the row it just removed.
+
+        A hit whose content matches a stored row for this user resolves to that
+        row's canonical ID (how an updated memory keeps its original ID);
+        unmatched hits get stable content-derived IDs and are inserted so a
+        later update/delete round-trips durably.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tombstones = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT content FROM tombstones WHERE user_id = ?", (user_id,)
+                ).fetchall()
+            }
+            visible = [
+                (text, res_meta) for text, res_meta in items if not _is_tombstoned(text, tombstones)
+            ]
+            resolved: list[Memory] = []
+            for text, res_meta in visible[:top_k]:
+                row = conn.execute(
+                    f"SELECT {self._SELECT_COLUMNS} FROM memories "  # noqa: S608
+                    "WHERE user_id = ? AND content = ? "
+                    "ORDER BY updated_at DESC, id LIMIT 1",
+                    (user_id, text),
+                ).fetchone()
+                if row is not None:
+                    resolved.append(self._row_to_memory(row))
+                    continue
+                memory = Memory(
+                    id=_stable_memory_id(user_id, text),
+                    content=text,
+                    user_id=user_id,
+                    session_id=session_id,
+                    importance=0.5,
+                    metadata=res_meta,
+                    created_at=now,
+                    valid_from=now,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO memories (id, user_id, content, importance, metadata_json,
+                                          created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        content = excluded.content,
+                        importance = excluded.importance,
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    self._memory_to_row(memory, now),
+                )
+                resolved.append(memory)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return resolved, len(visible)
 
 
 class CogneeBackend:
@@ -1040,20 +1151,70 @@ class CogneeBackend:
         if query_type.name == "GRAPH_COMPLETION":
             search_kwargs["only_context"] = True
 
-        try:
-            raw_results = await self._cognee.search(**search_kwargs)
-        except Exception as error:
-            # A dataset that exists but was never cognified has no vector
-            # collections yet; cognee raises NoDataError instead of returning
-            # nothing. An empty store is an empty result, not a failure.
-            if type(error).__name__ == "NoDataError":
-                logger.info(
-                    "cognee dataset %s has no searchable data yet; returning no results",
-                    self._config.dataset_name,
-                )
-                return []
-            raise
+        # Tombstoned hits are dropped after cognee ranked them, so a request
+        # for ``top_k`` is widened by the partition's tombstone count (this
+        # read only sizes the fetch; the authoritative filter runs inside the
+        # resolution transaction below) and re-issued with a doubled limit
+        # while a full page still yields fewer than ``top_k`` visible hits.
+        sizing_tombstones = await asyncio.to_thread(self._store.get_tombstones, user_id)
+        fetch_k = top_k + min(len(sizing_tombstones), _SEARCH_OVERFETCH_CAP)
+        texts: list[tuple[str, dict[str, Any]]] = []
+        for _round in range(_SEARCH_FETCH_ROUNDS):
+            search_kwargs["top_k"] = fetch_k
+            try:
+                raw_results = await self._cognee.search(**search_kwargs)
+            except Exception as error:
+                # A dataset that exists but was never cognified has no vector
+                # collections yet; cognee raises NoDataError instead of
+                # returning nothing. An empty store is an empty result, not a
+                # failure.
+                if type(error).__name__ == "NoDataError":
+                    logger.info(
+                        "cognee dataset %s has no searchable data yet; returning no results",
+                        self._config.dataset_name,
+                    )
+                    return []
+                raise
+            texts = self._collect_result_texts(raw_results)
+            visible_estimate = sum(
+                1 for text, _ in texts if not _is_tombstoned(text, sizing_tombstones)
+            )
+            page_full = len(texts) >= fetch_k
+            if visible_estimate >= top_k or not page_full or fetch_k >= _SEARCH_FETCH_HARD_CAP:
+                break
+            fetch_k = min(fetch_k * 2, _SEARCH_FETCH_HARD_CAP)
 
+        # Tombstone-filter BEFORE ranking so surviving results keep top
+        # ranks (and therefore high scores) when leading chunks were
+        # deleted/superseded, and resolve canonical IDs through the durable
+        # registry — in one transaction, so a delete committing meanwhile
+        # cannot have this search re-insert the row it just removed.
+        # Tombstones come from the durable store so deletions made by other
+        # instances / before a restart apply. The filter runs on every
+        # configured search type (text-match based — see module docstring
+        # for graph-synthesized caveats).
+        memories, total = await asyncio.to_thread(
+            self._store.resolve_search_results, user_id, session_id, texts, top_k, _utcnow()
+        )
+
+        results: list[MemorySearchResult] = []
+        for rank, memory in enumerate(memories):
+            results.append(
+                MemorySearchResult(
+                    memory=memory,
+                    # Rank-based scores compressed into (0.5, 1.0] so an
+                    # ordinal score can never be filtered out by the
+                    # proxy's default cosine min_similarity floor (0.3).
+                    score=1.0 - (rank / (2 * max(total, 1))),
+                    related_entities=entities or [],
+                    related_memories=[],
+                )
+            )
+
+        return results
+
+    def _collect_result_texts(self, raw_results: Any) -> list[tuple[str, dict[str, Any]]]:
+        """Flatten cognee's search return into ``(text, result_metadata)`` pairs."""
         texts: list[tuple[str, dict[str, Any]]] = []
         for res in raw_results or []:
             # cognee's search() return shape depends on backend access control
@@ -1078,91 +1239,7 @@ class CogneeBackend:
                 text = self._extract_text(item)
                 if text:
                     texts.append((text, res_meta))
-
-        # Tombstone-filter BEFORE ranking so surviving results keep top
-        # ranks (and therefore high scores) when leading chunks were
-        # deleted/superseded. Tombstones are read from the durable store so
-        # deletions made by other instances / before a restart apply. The
-        # filter runs on every configured search type (text-match based —
-        # see module docstring for graph-synthesized caveats).
-        user_tombstones = await asyncio.to_thread(self._store.get_tombstones, user_id)
-        visible = [
-            (text, res_meta)
-            for text, res_meta in texts
-            if not self._is_tombstoned(text, user_tombstones)
-        ]
-
-        # Resolve canonical IDs through the durable registry; unmatched
-        # results are inserted so later update/delete round-trips durably.
-        now = _utcnow()
-        memories = await asyncio.to_thread(
-            self._resolve_search_rows, user_id, session_id, visible[:top_k], now
-        )
-
-        results: list[MemorySearchResult] = []
-        total = len(visible)
-        for rank, memory in enumerate(memories):
-            results.append(
-                MemorySearchResult(
-                    memory=memory,
-                    # Rank-based scores compressed into (0.5, 1.0] so an
-                    # ordinal score can never be filtered out by the
-                    # proxy's default cosine min_similarity floor (0.3).
-                    score=1.0 - (rank / (2 * max(total, 1))),
-                    related_entities=entities or [],
-                    related_memories=[],
-                )
-            )
-
-        return results
-
-    def _resolve_search_rows(
-        self,
-        user_id: str,
-        session_id: str | None,
-        items: list[tuple[str, dict[str, Any]]],
-        now: datetime,
-    ) -> list[Memory]:
-        """Resolve search-result texts to canonical Memory rows (sync).
-
-        Runs in a worker thread. A result whose content matches a stored
-        memory row for this user returns that row's canonical ID (which is
-        how an updated memory keeps its original ID); unmatched results get
-        stable content-derived IDs AND are inserted into the registry so a
-        later update/delete round-trips durably.
-        """
-        resolved: list[Memory] = []
-        for text, res_meta in items:
-            memory = self._store.find_by_user_content(user_id, text)
-            if memory is None:
-                memory = Memory(
-                    id=_stable_memory_id(user_id, text),
-                    content=text,
-                    user_id=user_id,
-                    session_id=session_id,
-                    importance=0.5,
-                    metadata=res_meta,
-                    created_at=now,
-                    valid_from=now,
-                )
-                self._store.upsert_memory(memory)
-            resolved.append(memory)
-        return resolved
-
-    @staticmethod
-    def _is_tombstoned(text: str, tombstones: set[str]) -> bool:
-        """Whether a search-result chunk matches a tombstoned content.
-
-        Matches by exact equality or by substring containment (cognee chunks
-        long documents, so a chunk of a deleted memory is a substring of the
-        tombstoned original). Best-effort: text that cognee transformed
-        during cognify may not match.
-        """
-        if not tombstones:
-            return False
-        if text in tombstones:
-            return True
-        return any(text in tombstoned for tombstoned in tombstones)
+        return texts
 
     @staticmethod
     def _extract_text(item: Any) -> str:
@@ -1262,10 +1339,10 @@ class CogneeBackend:
         item holding the same text is never listed, never deleted, and never
         vouched for. Removal is PROVEN only when every content's hash is
         accounted for within that scope. The durable ``hard_deleted`` ledger
-        tracks each (owner, hash) as PENDING (every known item deleted, not
-        yet verified gone) or VERIFIED (a re-list found none). Only VERIFIED
-        counts as proof. Three phases, so a failure at any point leaves the
-        operation retryable:
+        tracks each (owner, hash) as PENDING (its items were observed and
+        their deletion begun, not yet verified gone) or VERIFIED (a re-list
+        found none). Only VERIFIED counts as proof. Three phases, so a
+        failure at any point leaves the operation retryable:
 
         1. Discovery (NON-MUTATING): map every unverified hash to its stored
            data items. A hash with no ledger row that matches no item makes
@@ -1273,15 +1350,19 @@ class CogneeBackend:
            matched" is not proof (a chunk-registered row hashes differently
            from its source item), and deleting the matched subset first would
            make the unmatched remainder permanently unprovable on retry. A
-           PENDING hash that matches no item is different: this call already
-           deleted its items, so absence completes its verification and the
-           hash is promoted to VERIFIED right away (progress is preserved
-           even if the rest of this call fails). A PENDING hash that still
-           matches items is deleted again.
-        2. Deletion: per hash, delete all its items, then durably record the
-           hash as PENDING — so an interruption between items never strands
-           an already-removed hash as unprovable, and an interruption after
-           deletion never lets an unverified hash pass as proof.
+           PENDING hash that matches no item is different: an earlier call
+           observed its items and set out to delete them, so absence
+           completes its verification and the hash is promoted to VERIFIED
+           right away (progress is preserved even if the rest of this call
+           fails). A PENDING hash that still matches items is deleted again.
+        2. Deletion: durably record EVERY matched hash as PENDING first, in
+           one write, then delete the items. Recording the intent before the
+           first ``delete_data`` means no interruption — between items, after
+           an item that carries several hashes, or right after a delete —
+           can strand a removed hash without a ledger row (which would make
+           it unprovable on retry), and a PENDING row never passes as proof.
+           A recorded hash whose delete then fails is harmless: its item is
+           still observable, so the retry re-matches and deletes it.
         3. Verification: re-list. Hashes with no matching item left are
            promoted to VERIFIED; hashes whose items remain have their ledger
            entries cleared (the items are observable, so a retry rediscovers
@@ -1349,25 +1430,23 @@ class CogneeBackend:
             if not matched:
                 return True
 
-            # Phase 2 — delete per hash, recording each completed hash as pending.
-            items_by_hash: dict[str, list[tuple[Any, Any]]] = {}
-            for dataset_id, data_id, overlap in found:
-                for h in overlap:
-                    items_by_hash.setdefault(h, []).append((dataset_id, data_id))
+            # Phase 2 — record the intent for every matched hash, then delete
+            # the items. The ledger row precedes the first delete so an item
+            # carrying several hashes, or an interruption anywhere in the
+            # loop, can never leave a removed hash without a row.
+            await asyncio.to_thread(
+                self._store.record_hard_delete_pending, dataset_name, owner, matched
+            )
             deleted_ids: set[Any] = set()
-            for h, items in items_by_hash.items():
-                for dataset_id, data_id in items:
-                    if data_id in deleted_ids:
-                        continue
-                    await datasets_api.delete_data(dataset_id=dataset_id, data_id=data_id)
-                    deleted_ids.add(data_id)
-                    logger.info(
-                        "Hard-deleted cognee data item %s from dataset %s",
-                        data_id,
-                        dataset_name,
-                    )
-                await asyncio.to_thread(
-                    self._store.record_hard_delete_pending, dataset_name, owner, {h}
+            for dataset_id, data_id, _overlap in found:
+                if data_id in deleted_ids:
+                    continue
+                await datasets_api.delete_data(dataset_id=dataset_id, data_id=data_id)
+                deleted_ids.add(data_id)
+                logger.info(
+                    "Hard-deleted cognee data item %s from dataset %s",
+                    data_id,
+                    dataset_name,
                 )
 
             # Phase 3 — verification: nothing matching may remain. Hashes

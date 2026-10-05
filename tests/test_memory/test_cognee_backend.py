@@ -1210,6 +1210,107 @@ class TestIdenticalContentUpdate:
         assert await asyncio.to_thread(backend._store.get_tombstones, "alice") == {content}
 
 
+class TestLedgerIntentPrecedesDeletion:
+    """Every matched hash is recorded PENDING before the first ``delete_data``,
+    so no interruption can strand a removed hash without a ledger row."""
+
+    async def test_pending_rows_are_written_before_the_first_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        content, fact = "the main content", "an extracted fact"
+        module, _ = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", [_item("d1", content), _item("d2", fact)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+
+        order: list[str] = []
+        real_record = backend._store.record_hard_delete_pending
+        real_delete = module.datasets.delete_data
+
+        def recording(dataset, owner, hashes):
+            order.append(f"pending:{len(hashes)}")
+            real_record(dataset, owner, hashes)
+
+        async def deleting(dataset_id=None, data_id=None):
+            order.append(f"delete:{data_id}")
+            await real_delete(dataset_id=dataset_id, data_id=data_id)
+
+        monkeypatch.setattr(backend._store, "record_hard_delete_pending", recording)
+        monkeypatch.setattr(module.datasets, "delete_data", deleting)
+
+        assert await backend.delete_memory(memory.id) is True
+        assert order == ["pending:2", "delete:d1", "delete:d2"]
+
+    async def test_multi_hash_item_interrupted_right_after_its_delete_stays_provable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One data item carries both the content's and the fact's hash. Its
+        deletion goes through but the call dies immediately after; the retry
+        finds both hashes PENDING with no item left and completes the proof
+        instead of reporting them unprovable forever."""
+        content, fact = "the main content", "an extracted fact"
+        module, _ = _make_fake_cognee()
+        shared_item = _item("d1", content, raw_content_hash=_md5(fact))
+        calls = _attach_fake_datasets_api(module, "ds", [shared_item])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(
+            content=content, user_id="alice", importance=0.5, facts=[fact]
+        )
+
+        real_delete = module.datasets.delete_data
+        armed = {"crash": True}
+
+        async def delete_then_die(dataset_id=None, data_id=None):
+            await real_delete(dataset_id=dataset_id, data_id=data_id)  # item really goes
+            if armed.pop("crash", False):
+                raise RuntimeError("process died right after delete_data returned")
+
+        monkeypatch.setattr(module.datasets, "delete_data", delete_then_die)
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert calls.live_items == []
+        assert await backend.get_memory(memory.id) is not None
+
+        assert await backend.delete_memory(memory.id) is True
+        assert await backend.get_memory(memory.id) is None
+        ledger = await asyncio.to_thread(
+            backend._store.get_hard_delete_ledger, "ds", "alice", {_md5(content), _md5(fact)}
+        )
+        assert ledger == {_md5(content): True, _md5(fact): True}
+
+    async def test_pending_row_whose_delete_failed_is_not_proof(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recording intent first must not turn a failed delete into proof:
+        the item is still there, so the retry re-matches, deletes and only
+        then verifies."""
+        module, _ = _make_fake_cognee()
+        calls = _attach_fake_datasets_api(module, "ds", [_item("d1", "doomed")], fail_once_on="d1")
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(content="doomed", user_id="alice", importance=0.5)
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+        assert [item.id for item in calls.live_items] == ["d1"]
+        ledger = await asyncio.to_thread(
+            backend._store.get_hard_delete_ledger, "ds", "alice", {_md5("doomed")}
+        )
+        assert ledger == {_md5("doomed"): False}  # pending, never proof
+
+        assert await backend.delete_memory(memory.id) is True
+        assert calls.live_items == []
+        assert [d["data_id"] for d in calls.deleted] == ["d1"]
+
+
 # =============================================================================
 # Deletion contract under synthesized search types (fail closed)
 # =============================================================================
@@ -1591,6 +1692,147 @@ class TestSynthesizedModeDeletionContract:
         memory = await backend.save_memory(content=content, user_id="alice", importance=0.5)
         assert await backend.delete_memory(memory.id) is True
         assert await backend.search_memories(query="q", user_id="alice") == []
+
+
+# =============================================================================
+# Search read path: delete/search race, top_k exhaustion by tombstoned hits
+# =============================================================================
+
+
+class TestSearchReadPath:
+    async def test_delete_committing_during_search_cannot_resurrect_the_memory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A delete that commits after the search read cognee's hits but
+        before it resolved them must still be honoured: the tombstone filter
+        and the registry insert run in one transaction, so the search neither
+        returns the deleted content nor re-inserts its row."""
+        content = "old fact"
+        module, _ = _make_fake_cognee(search_results=[_fake_hit([content])])
+        _attach_fake_datasets_api(module, "ds", [_item("data-1", content)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content=content, user_id="alice", importance=0.5)
+
+        # The delete lands between cognee returning hits and their resolution.
+        real_search = module.search
+
+        async def search_then_delete(**kwargs):
+            hits = await real_search(**kwargs)
+            assert await backend.delete_memory(memory.id) is True
+            return hits
+
+        module.search = search_then_delete
+
+        assert await backend.search_memories(query="fact", user_id="alice") == []
+        assert await backend.get_memory(memory.id) is None
+        assert (
+            await asyncio.to_thread(backend._store.find_by_user_content, "alice", content) is None
+        )
+
+    async def test_search_resolution_is_one_write_transaction(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """The store's resolver filters and inserts under BEGIN IMMEDIATE: a
+        tombstone written by another connection before it starts is seen,
+        and a hit is never inserted when tombstoned."""
+        store = cognee_backend_module._CogneeMetadataStore(tmp_path / "meta.db")
+        store.add_tombstones("alice", ["gone"])
+        memories, visible = store.resolve_search_results(
+            "alice",
+            None,
+            [("gone", {}), ("live", {}), ("also live", {})],
+            top_k=1,
+            now=cognee_backend_module._utcnow(),
+        )
+        assert [m.content for m in memories] == ["live"]
+        assert visible == 2
+        assert store.find_by_user_content("alice", "gone") is None
+        assert store.find_by_user_content("alice", "live") is not None
+        # Beyond top_k is counted but not inserted.
+        assert store.find_by_user_content("alice", "also live") is None
+
+    async def test_tombstoned_hits_do_not_exhaust_top_k(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cognee ranks two deleted memories above a live one; with top_k=2
+        the live one must still be returned (bounded over-fetch)."""
+        ranked = ["deleted A", "deleted B", "live C"]
+        module, calls = _make_fake_cognee()
+
+        async def ranked_search(**kwargs):
+            calls.search.append(kwargs)
+            return [_fake_hit(ranked[: kwargs["top_k"]])]
+
+        module.search = ranked_search
+        _attach_fake_datasets_api(module, "ds", [_item(f"d{i}", c) for i, c in enumerate(ranked)])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        for text in ranked:
+            await backend.save_memory(content=text, user_id="alice", importance=0.5)
+        for text in ranked[:2]:
+            mem = await asyncio.to_thread(backend._store.find_by_user_content, "alice", text)
+            assert mem is not None
+            assert await backend.delete_memory(mem.id) is True
+
+        results = await backend.search_memories(query="q", user_id="alice", top_k=2)
+        assert [r.memory.content for r in results] == ["live C"]
+        # The request was widened by the partition's tombstone count up front.
+        assert calls.search[0]["top_k"] == 4
+        assert len(calls.search) == 1
+
+    async def test_over_fetch_grows_when_one_tombstone_filters_many_fragments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deleted long memory is chunked, so ONE tombstone filters every
+        fragment cognee ranks — more hits than the tombstone count the fetch
+        was widened by. The fetch then doubles, bounded, until a live hit
+        appears or the page comes back short."""
+        deleted = "alpha beta gamma delta"
+        fragments = ["alpha beta", "beta gamma", "gamma delta", "alpha", "beta", "gamma"]
+        ranked = [*fragments, "live"]
+        module, calls = _make_fake_cognee()
+
+        async def ranked_search(**kwargs):
+            calls.search.append(kwargs)
+            return [_fake_hit(ranked[: kwargs["top_k"]])]
+
+        module.search = ranked_search
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        await backend.save_memory(content="live", user_id="alice", importance=0.5)
+        await asyncio.to_thread(backend._store.add_tombstones, "alice", [deleted])
+        # Another partition's tombstones never widen alice's fetch.
+        await asyncio.to_thread(backend._store.add_tombstones, "bob", ["x", "y", "z"])
+
+        results = await backend.search_memories(query="q", user_id="alice", top_k=2)
+        assert [r.memory.content for r in results] == ["live"]
+        # 2 + 1 tombstone, then doubled while full pages stayed tombstoned;
+        # the last page is short (7 hits < 12) so the loop stops there.
+        assert [k["top_k"] for k in calls.search] == [3, 6, 12]
+
+    async def test_over_fetch_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A partition whose every hit is a fragment of one deleted memory
+        stops after a fixed number of rounds instead of paging cognee forever."""
+        deleted = " ".join(f"w{i}" for i in range(5000))
+        module, calls = _make_fake_cognee()
+
+        async def all_fragments(**kwargs):
+            calls.search.append(kwargs)
+            return [_fake_hit([f"w{i}" for i in range(kwargs["top_k"])])]
+
+        module.search = all_fragments
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        await asyncio.to_thread(backend._store.add_tombstones, "alice", [deleted])
+
+        assert await backend.search_memories(query="q", user_id="alice", top_k=3) == []
+        assert [k["top_k"] for k in calls.search] == [4, 8, 16]
+        assert len(calls.search) == cognee_backend_module._SEARCH_FETCH_ROUNDS
 
 
 # =============================================================================
