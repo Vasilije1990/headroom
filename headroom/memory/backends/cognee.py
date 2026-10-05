@@ -70,14 +70,19 @@ Deletion contract (split by search type):
       verification of pending hashes rather than trusting them — so a failed
       or interrupted attempt is always retryable and never passes as
       success. This backend never reports a deletion it cannot stand behind.
-    - The hard delete is scoped to the OWNING USER. cognee identifies text by
-      content hash, so two users who stored the same text share a hash; it
-      keeps one data item per node set (the node set is part of its dedup
-      identity), so each user's copy is a separate item tagged ``user:<id>``.
-      Discovery, deletion, verification and the ledger all act only on items
-      carrying the owner's tag: deleting Alice's memory never touches Bob's
-      identical one, and a removal verified for Alice never vouches for Bob.
-      An item whose tags cannot be read is nobody's and is never deleted.
+    - The hard delete is TENANT-SCOPED. The ``user_id`` this backend receives
+      is headroom's memory partition id — the tenant identity the proxy
+      resolves for the request (``resolve_memory_identity``), composed with
+      the project key in project mode — and it is carried on every cognee
+      data item as the ``user:<partition>`` node-set tag. cognee identifies
+      text by content hash, so two tenants who stored the same text share a
+      hash; it keeps one data item per node set (the node set is part of its
+      dedup identity), so each tenant's copy is a separate item. Discovery,
+      deletion, verification and the ledger all act only on items carrying
+      the tenant's tag: deleting tenant A's memory never touches tenant B's
+      identical one, and a removal verified for A never vouches for B. An
+      item whose tags cannot be read belongs to no tenant and is never
+      deleted.
     - ``update_memory`` with unchanged content is a metadata-only rewrite:
       nothing is tombstoned, reclaimed or re-added, since the stored item IS
       the new content. A fact equal to the new content is likewise kept.
@@ -620,7 +625,7 @@ class _CogneeMetadataStore:
 
     # -- hard-delete ledger ---------------------------------------------------
     # Records content hashes this store has hard-deleted from a cognee
-    # dataset FOR ONE OWNER (the memory's user), in one of two states:
+    # dataset FOR ONE OWNER (the memory's tenant partition id), in one of two states:
     #
     # - PENDING: ``delete_data`` was issued (and returned) for every data
     #   item known for the hash, but no re-list has yet confirmed the items
@@ -1195,6 +1200,7 @@ class CogneeBackend:
         cognee keeps them on ``Data.node_set`` (a JSON-encoded list on ORM
         rows, a list on API rows since cognee exposes ``nodeSet``) and mirrors
         them in ``external_metadata["node_set"]``; both spellings are read.
+        The ``user:<partition>`` tag among them is the tenant boundary.
         """
         raw = getattr(data_item, "node_set", None)
         if raw is None:
@@ -1220,11 +1226,12 @@ class CogneeBackend:
     ) -> list[tuple[Any, Any, set[str]]]:
         """List (dataset_id, data_id, matching_hashes) without mutating anything.
 
-        Only data items tagged with ``owner_tag`` (the memory owner's
-        ``node_set`` tag) count. Two users who stored the same text hold the
-        same content hash in one dataset, and cognee keeps one data item per
-        node set — so the tag, not the hash, is the ownership boundary.
-        An item whose tags cannot be read is nobody's and never matched.
+        Only data items tagged with ``owner_tag`` (the ``user:<partition>``
+        node-set tag of the memory's tenant partition) count. Two tenants who
+        stored the same text hold the same content hash in one dataset, and
+        cognee keeps one data item per node set — so the tag, not the hash,
+        is the tenant boundary. An item whose tags cannot be read belongs to
+        no tenant and is never matched.
         """
         found: list[tuple[Any, Any, set[str]]] = []
         for dataset in await datasets_api.list_datasets() or []:
@@ -1244,12 +1251,15 @@ class CogneeBackend:
         return found
 
     async def _try_hard_delete(self, contents: list[str], owner_id: str) -> bool:
-        """Hard-delete ONE OWNER's data items from cognee's stores; report whether proven.
+        """Hard-delete ONE TENANT's data items from cognee's stores; report whether proven.
 
-        cognee identifies text data items by an MD5 content hash and keeps one
-        item per node set, so discovery, deletion, verification and the ledger
-        are all scoped to the owner's ``user:<id>`` tag: another user's item
-        holding the same text is never listed, never deleted, and never
+        ``owner_id`` is the memory's partition id — the tenant identity the
+        proxy resolved for the request, composed with the project key in
+        project mode; what this backend receives as ``user_id``. cognee
+        identifies text data items by an MD5 content hash and keeps one item
+        per node set, so discovery, deletion, verification and the ledger are
+        all scoped to the tenant's ``user:<partition>`` tag: another tenant's
+        item holding the same text is never listed, never deleted, and never
         vouched for. Removal is PROVEN only when every content's hash is
         accounted for within that scope. The durable ``hard_deleted`` ledger
         tracks each (owner, hash) as PENDING (every known item deleted, not

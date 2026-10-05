@@ -907,8 +907,9 @@ def _item(data_id: str, content: str, owner: str = "alice", **extra: Any) -> Sim
     """A fake cognee data item for ``content`` stored under ``owner``'s node set.
 
     Mirrors what cognee's datasets API lists: the content hash plus the
-    ``node_set`` tags the item was added with (``user:<id>`` is the
-    ownership boundary the backend's hard delete is scoped to).
+    ``node_set`` tags the item was added with (``user:<partition>`` is the
+    tenant boundary the backend's hard delete is scoped to; ``owner`` is a
+    memory partition id, what the backend receives as ``user_id``).
     """
     fields: dict[str, Any] = {
         "id": data_id,
@@ -1008,18 +1009,21 @@ class TestBestEffortHardDelete:
 
 
 # =============================================================================
-# Hard delete is scoped to the owning user (user:<id> node-set tag)
+# Hard delete is tenant-scoped (user:<partition> node-set tag)
 # =============================================================================
 
 
-class TestUserScopedHardDelete:
-    """Two users who store the same text hold the same content hash. cognee
-    keeps one data item per node set (dedup identity includes ``node_set``),
-    so the backend must only ever discover, delete, verify and ledger the
-    OWNER's item — never the other user's."""
+class TestTenantScopedHardDelete:
+    """The backend's ``user_id`` is headroom's memory partition id — the
+    tenant identity the proxy resolved (plus the project key in project
+    mode). Two tenants who store the same text hold the same content hash;
+    cognee keeps one data item per node set (dedup identity includes
+    ``node_set``), so the backend must only ever discover, delete, verify
+    and ledger the memory's OWN tenant's item — never another tenant's.
+    ``alice`` / ``bob`` below are two tenant partitions."""
 
     @pytest.mark.parametrize("search_type", ["CHUNKS", "GRAPH_COMPLETION"])
-    async def test_alices_delete_leaves_bobs_identical_memory(
+    async def test_tenant_delete_leaves_other_tenants_identical_memory(
         self, monkeypatch: pytest.MonkeyPatch, search_type: str
     ) -> None:
         shared = "the deploy runs on Fridays"
@@ -1047,12 +1051,12 @@ class TestUserScopedHardDelete:
         assert [r.memory.content for r in bob_results] == [shared]
         assert await backend.search_memories(query="deploy", user_id="alice") == []
 
-    async def test_other_users_item_is_not_proof_of_removal(
+    async def test_other_tenants_item_is_not_proof_of_removal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Under a synthesized search type, the only item holding Alice's
-        text belongs to Bob: deleting it would be data loss and proves
-        nothing about Alice's data, so the delete fails closed."""
+        """Under a synthesized search type, the only item holding tenant
+        Alice's text belongs to tenant Bob: deleting it would be data loss
+        and proves nothing about Alice's data, so the delete fails closed."""
         shared = "the deploy runs on Fridays"
         module, _ = _make_fake_cognee()
         calls = _attach_fake_datasets_api(module, "ds", [_item("data-bob", shared, owner="bob")])
@@ -1066,10 +1070,10 @@ class TestUserScopedHardDelete:
         assert calls.deleted == []
         assert [item.id for item in calls.live_items] == ["data-bob"]
 
-    async def test_items_without_node_set_are_nobodys(
+    async def test_items_without_node_set_belong_to_no_tenant(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An item whose owner cannot be read is never deleted on a hash match."""
+        """An item whose tenant tag cannot be read is never deleted on a hash match."""
         module, _ = _make_fake_cognee()
         untagged = SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)
         calls = _attach_fake_datasets_api(module, "ds", [untagged])
@@ -1083,7 +1087,7 @@ class TestUserScopedHardDelete:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """cognee spells the tags as a JSON string on ORM rows and mirrors
-        them into ``external_metadata``; both resolve to the owner."""
+        them into ``external_metadata``; both resolve to the tenant tag."""
         module, _ = _make_fake_cognee()
         items = [
             _item("json-row", "one", node_set='["user:alice", "session:s1"]'),
@@ -1101,8 +1105,8 @@ class TestUserScopedHardDelete:
         assert await backend._try_hard_delete(["one", "two"], "alice") is True
         assert sorted(d["data_id"] for d in calls.deleted) == ["external-row", "json-row"]
 
-    async def test_ledger_proof_is_per_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Alice's verified removal must not vouch for Bob's identical text."""
+    async def test_ledger_proof_is_per_tenant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Tenant Alice's verified removal must not vouch for tenant Bob's identical text."""
         shared = "the deploy runs on Fridays"
         module, _ = _make_fake_cognee()
         _attach_fake_datasets_api(module, "ds", [_item("data-alice", shared, owner="alice")])
@@ -1504,19 +1508,19 @@ class TestSynthesizedModeDeletionContract:
             conn.close()
 
         store = cognee_backend_module._CogneeMetadataStore(db_path)
-        # Legacy rows carry no owner; they are reported to every owner as
-        # PENDING until that owner's own verification replaces them.
+        # Legacy rows carry no tenant; they are reported to every tenant as
+        # PENDING until that tenant's own verification replaces them.
         assert store.get_hard_delete_ledger("ds", "alice", {content_hash}) == {content_hash: False}
         assert store.get_hard_delete_ledger("ds", "bob", {content_hash}) == {content_hash: False}
 
         store.mark_hard_delete_verified("ds", "alice", {content_hash})
         assert store.get_hard_delete_ledger("ds", "alice", {content_hash}) == {content_hash: True}
-        # Alice's verification is hers alone: Bob's identical content is not
-        # vouched for, and the legacy row it replaced is gone.
+        # Tenant Alice's verification is hers alone: tenant Bob's identical
+        # content is not vouched for, and the legacy row it replaced is gone.
         assert store.get_hard_delete_ledger("ds", "bob", {content_hash}) == {}
 
-    def test_owner_keyed_ledger_migrates_from_dataset_keyed(self, tmp_path) -> None:
-        """A ledger from the pending/verified era but before owner scoping
+    def test_tenant_keyed_ledger_migrates_from_dataset_keyed(self, tmp_path) -> None:
+        """A ledger from the pending/verified era but before tenant scoping
         (no ``owner`` column) is migrated in place; its rows keep their
         hashes but lose their proof — PENDING, since the verification that
         wrote them did not check whose item was removed."""
